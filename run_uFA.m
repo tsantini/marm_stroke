@@ -3,7 +3,7 @@ clc; clearvars
 addpath matmri
 setPath
 
-files = dir('E:\250425-processing_marm_stroke\2022_marmStroke\all_OGSE_uFA\BM4D_PCAMoeda_20230116125945*uFAa.nii');
+files = dir('E:\250425-processing_marm_stroke\2022_marmStroke\all_OGSE_uFA\BM4D_PCAMoeda_*uFAa.nii');
 
 for i = 1:length(files)
     bmat=load([files(i).folder filesep erase(files(i).name,'.nii') '.bmat']);
