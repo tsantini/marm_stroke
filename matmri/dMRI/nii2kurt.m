@@ -115,12 +115,23 @@ if gpuDeviceCount >= 1 && ~opt.noGPU
 end
 
 %% Read in files
-im = niftiread(file);
+if ischar(file)
+    im = niftiread(file);
+    im = single(im);
+else
+    % Allow directly supplying array data
+    im = file;
+end
 im = single(im); % convert to single. Log function doesnt work with integer types.
 im(im<10E-15)=10E-15; %We can get negative values after preprocessing
 szIm = size(im);
-bval = load([bfiles,'.bval']); 
-bvec = load([bfiles,'.bvec']);
+if ischar(bfiles)
+    bval = load([bfiles,'.bval']); 
+    bvec = load([bfiles,'.bvec']);
+else
+    bval=bfiles.bval;
+    bvec=bfiles.bvec;
+end
 bval = bval(:);
 bvec = bvec.';
 bvec = bvec./sum(bvec.^2,2); % normalize
@@ -361,6 +372,7 @@ FAvec = mean(FA,4).*vec;
 % Create NIFTI files. Inherit header information from input NIFTI
 if opt.saveNifti
     im_info = niftiinfo(file);
+    im_info.MultiplicativeScaling=1;
     if length(fshells) == 1 % Case for only one frq, so final images are 3D
         im_info.PixelDimensions = im_info.PixelDimensions(1:3);
         im_info.ImageSize = im_info.ImageSize(1:3);
@@ -398,15 +410,18 @@ if opt.saveNifti
     Dpowder(Dpowder>10 | Dpowder<0) = 0;
     Wpowder(Wpowder>10 | Wpowder<0) = 0;
 
-    niftiwrite(single(Dmean), sprintf('%s_Dmean', savename), im_info, 'Compressed', true);
-    niftiwrite(single(Dpar), sprintf('%s_Dpar', savename), im_info, 'Compressed', true);
-    niftiwrite(single(Dperp), sprintf('%s_Dperp', savename), im_info, 'Compressed', true);
-    niftiwrite(single(Wmean), sprintf('%s_Wmean', savename), im_info, 'Compressed', true);
-    niftiwrite(single(Kpar), sprintf('%s_Kpar', savename), im_info, 'Compressed', true);
-    niftiwrite(single(Kperp), sprintf('%s_Kperp', savename), im_info, 'Compressed', true);
-    niftiwrite(single(FA), sprintf('%s_FA', savename), im_info, 'Compressed', true);
-    niftiwrite(single(Dpowder), sprintf('%s_Dpowder', savename), im_info, 'Compressed', true);
-    niftiwrite(single(Wpowder), sprintf('%s_Wpowder', savename), im_info, 'Compressed', true);
+    freq_order=freqs(1:length(fshells));
+    [~,freq_order_index] = sort(freq_order);
+
+    niftiwrite(single(Dmean(:,:,:,freq_order_index)), sprintf('%s_Dmean', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Dpar(:,:,:,freq_order_index)), sprintf('%s_Dpar', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Dperp(:,:,:,freq_order_index)), sprintf('%s_Dperp', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Wmean(:,:,:,freq_order_index)), sprintf('%s_Wmean', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Kpar(:,:,:,freq_order_index)), sprintf('%s_Kpar', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Kperp(:,:,:,freq_order_index)), sprintf('%s_Kperp', savename), im_info, 'Compressed', true);
+    niftiwrite(single(FA(:,:,:,freq_order_index)), sprintf('%s_FA', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Dpowder(:,:,:,freq_order_index)), sprintf('%s_Dpowder', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Wpowder(:,:,:,freq_order_index)), sprintf('%s_Wpowder', savename), im_info, 'Compressed', true);
 
     % update 4D nifti info data for FA vec file if multiple freq avialable
     if length(fshells) == 1 % Case for only one frq, so final images are 3D
@@ -424,6 +439,30 @@ if opt.saveNifti
     
     niftiwrite(single(abs(FAvec)), sprintf('%s_FAvec', savename), im_info, 'Compressed', true);
     dlmwrite(sprintf('%s.fshells', savename),fshells)
+    
+    % getting the delta maps
+    im_info_delta=im_info;
+    im_info_delta.PixelDimensions = im_info.PixelDimensions(1:3);
+    im_info_delta.ImageSize = im_info.ImageSize(1:3);
+    im_info_delta.raw.dim(1) = 3;
+    im_info_delta.raw.dim(5) = 1;
+    im_info_delta.raw.pixdim(5) = 0;
+    im_info_delta.raw.dim_info = ' ';
+
+
+    [~,highest_freq_index]=max(freqs);
+    [~,lowest_freq_index]=min(freqs);
+
+    niftiwrite(single(Dmean(:,:,:,highest_freq_index)-Dmean(:,:,:,lowest_freq_index)), sprintf('%s_delta_Dmean', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(Dpar(:,:,:,highest_freq_index)-Dpar(:,:,:,lowest_freq_index)), sprintf('%s_delta_Dpar', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(Dperp(:,:,:,highest_freq_index)-Dperp(:,:,:,lowest_freq_index)), sprintf('%s_delta_Dperp', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(Wmean(:,:,:,highest_freq_index)-Wmean(:,:,:,lowest_freq_index)), sprintf('%s_delta_Wmean', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(Kpar(:,:,:,highest_freq_index)-Kpar(:,:,:,lowest_freq_index)), sprintf('%s_delta_Kpar', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(Kperp(:,:,:,highest_freq_index)-Kperp(:,:,:,lowest_freq_index)), sprintf('%s_delta_Kperp', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(FA(:,:,:,highest_freq_index)-FA(:,:,:,lowest_freq_index)), sprintf('%s_delta_FA', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(Dpowder(:,:,:,highest_freq_index)-Dpowder(:,:,:,lowest_freq_index)), sprintf('%s_delta_Dpowder', savename), im_info_delta, 'Compressed', true);
+    niftiwrite(single(Wpowder(:,:,:,highest_freq_index)-Wpowder(:,:,:,lowest_freq_index)), sprintf('%s_delta_Wpowder', savename), im_info_delta, 'Compressed', true);
+
 end
 
 fprintf('took %d sec\n', round(toc(tic1)));
