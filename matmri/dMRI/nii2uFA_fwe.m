@@ -1,0 +1,482 @@
+function [uFA,Kiso,Klin,D,sf,uA2, uFA_noFWE,Klin_noFWE,Kiso_noFWE,D_noFWE,sSTE,sLTE] = nii2uFA_fwe(file, bvals, isIso, maskfile, D_CSF, opt, savename)
+%
+%   Estimate microscopic fractional anisotropy and related parameters with a 
+%   free water elimination approach applied to the powder average signal.
+%
+%   INPUTS
+%   file:       path to NIFTI file containing raw image data
+%   bvals:      path to .bval file containing b-values (in same format as FSL expects 
+%                   and dcm2niix outputs)
+%   isIso:      path to file in the same format as .bval file, but instead specifying 
+%                   which acquisitions are LTE (0 in file) or STE (1 in file)
+%                   Alternate Usage: the user may also input a matlab vector
+%                   Alternate Usage 2: provide a .bmat file that has the
+%                       full b-matrix. Expected formats: 
+%                           Bxx Byy Bzz Bxy Bxz Byz
+%                             or
+%                           Bxx Bxy Bxz Bxy Byy Byz Bxz Byz Bzz
+%   D_CSF:      (optional) presumed ADC for CSF (mm2/s). default = 3e-3 
+%   maskfile:   (optional) path to NIFTI file containing a binary mask
+%   opt:        (optional) structure that contains options for algorithm.
+%                   See comments where defaults are set in code for info.
+%   savename:   (optional) filename for output nifti. Exclude extension.
+%                It can be the fullpath+filename for a different output directory.
+%
+%   OUTPUTS
+%   uFA:        FWE corrected microscopic fractional anisotropy
+%   Klin:       total kurtosis (i.e., from linear tensor encoding)
+%   Kiso:       isotropic kurtosis (i.e., from spherical tensor encoding)
+%   D:          apparent diffusion coefficient 
+%   sf:         fraction of tissue signal
+%   *_noFWE:        same descriptions as above, but without FWE model
+%
+%   (c) 2022, Nico Arezza and Corey Baron
+
+% Start timer
+tic_a = tic;
+
+%% Set option defaults
+if nargin < 4
+    maskfile = [];
+end
+if (nargin < 5) || isempty(D_CSF)
+    D_CSF = 3e-3;
+end
+
+% Options used by uFA_fwe
+if nargin<6 || ~isfield(opt,'bthresh') || isempty(opt.bthresh)
+    % Threshold for difference between b-shells
+    opt.bthresh = 50;
+end
+
+if nargin<7
+    savename = [];
+end
+
+if ~isfield(opt,'noGPU') || isempty(opt.noGPU)
+    % Disable automatic usage of GPU
+    opt.noGPU = 0;
+end
+if ~isfield(opt,'saveNifti') || isempty(opt.saveNifti)
+    % Save nifti outputs. Nifti's for parameters computed without the
+    % FWE model are only saved if more than 5 outputs are specified when
+    % the function is called. 
+    opt.saveNifti = true;
+end
+doFWEsupplied = 0;
+if ~isfield(opt,'doFWE') || isempty(opt.doFWE)
+    % Free water elimination on by default
+    opt.doFWE = 1;
+else
+    doFWEsupplied = 1;
+end
+
+% Options for both estD_powderFWE and estKurt_powderFWE
+if ~isfield(opt,'sigTisThresh') || isempty(opt.sigTisThresh)
+    % Only try to compute diffusion coefficients etc if frac of signal in tissue is larger than this
+    opt.sigTisThresh = 0.1;
+end
+if ~isfield(opt,'verbose') || isempty(opt.verbose)
+    % Print out information
+    opt.verbose = 1;
+end
+
+% Options for estD_powderFWE
+if ~isfield(opt,'nIter1') || isempty(opt.nIter1)
+    % Number of iterations for step 1 (low b-value estimation of signal
+    % ratio)
+    opt.nIterLowb = 100;
+end
+if ~isfield(opt,'Dtissue0') || isempty(opt.Dtissue0)
+    % Starting guess for tissue ADC (mm2/s)
+    opt.Dtissue0 = 0.7e-3;
+end
+
+% Options for estKurt_powderFWE
+if ~isfield(opt,'NitEstKurt') || isempty(opt.NitEstKurt)
+    % Number of iterations for step 2 (full kurtosis estimation)
+    opt.NitEstKurt = 100;
+end
+if ~isfield(opt,'KsteThresh') || isempty(opt.KsteThresh)
+    % Threshold for suspiciously Kste 
+    % Small neg vals are allowed because microscopic kurtosis, which
+    % contributes to Kste, can theoretically be negative
+    opt.KsteThresh = -0.5;
+end
+
+
+% Check for gpu support
+useGPU = 0;
+if gpuDeviceCount >= 1 && ~opt.noGPU
+    if opt.verbose
+        fprintf('Using GPU...\n')
+    end
+    gpuDevice;
+    useGPU = 1;
+end
+
+%% Read in files
+if ischar(file)
+    im = niftiread(file);
+    im = single(im);
+else
+    % Allow directly supplying array data
+    im = file;
+end
+if ischar(bvals)
+    bval = load(bvals);
+    try
+        bvec = load([erase(bvals,'.bval') '.bvec']);
+        has_bvec=1;
+    catch
+        has_bvec=0;
+    end
+else
+    bval = bvals;
+    has_bvec=0;
+end
+clear bvals
+if ischar(isIso)
+    % Text file, in the same format as .bval file, which indicates which
+    % acquisitions are STE (1) and LTE (0). If this is not a string, we
+    % presume the user inputted the list directly
+    bmat = load(isIso);
+    if size(bmat,1) > 1 && size(bmat,2) > 1 
+        % Bmatrix supplied. Find isotropic ones that have a bmatrix rank of
+        % 3
+        if size(bmat,1) == length(bval)
+            bmat = bmat';
+        end
+        brank = bmatRank(bmat, opt.bthresh/3);
+        isIso = brank > 2.5;
+        if any(brank==2)
+            error('Planar encoding detected, but fitting model does not account for this');
+        end
+    end
+end
+if isempty(maskfile)
+    sz = size(im);
+    mask = true(sz(1:3));
+else
+    mask = niftiread(maskfile);
+    mask = logical(mask);
+end
+
+% Take abs of image, in case of negative values after denoising etc.
+im = abs(im);
+
+% Expand mask to include voxels that are 0 in all acquisitions (can happen
+% from eddy current correction)
+mask = and(mask, sum(im,4) > 2*eps);
+
+%% Find and sort b-shells
+bval = bval(:);
+isIso = isIso(:);
+
+% Rough estimate of shells
+bshells_ste = [];
+bshells_lte = [];
+for n=1:length(bval)
+    if isIso(n)
+        if isempty(bshells_ste)
+            bshells_ste = bval(n);
+        elseif ~any(abs(bval(n)-bshells_ste) < opt.bthresh)
+            bshells_ste = cat(1,bshells_ste,bval(n));
+        end
+    else
+        if isempty(bshells_lte)
+            bshells_lte = bval(n);
+        elseif ~any(abs(bval(n)-bshells_lte) < opt.bthresh)
+            bshells_lte = cat(1,bshells_lte,bval(n));
+        end
+    end
+end
+
+% Use mean b-value for each shell, then sort the lists
+for n=1:length(bshells_ste)
+    inds = and(isIso, abs(bval-bshells_ste(n))<opt.bthresh);
+    bshells_ste(n)=mean(bval(inds));
+end
+for n=1:length(bshells_lte)
+    inds = and(~isIso, abs(bval-bshells_lte(n))<opt.bthresh);
+    bshells_lte(n)=mean(bval(inds));
+end
+bshells_ste=sort(bshells_ste,'ascend');
+bshells_lte=sort(bshells_lte,'ascend');
+
+% Print the shells
+fprintf('nii2uFA_fwe: LTE shells:'); 
+for n=1:length(bshells_lte)
+    fprintf(' %d,', round(bshells_lte(n)));
+end
+fprintf('. STE shells:'); 
+ for n=1:length(bshells_ste)
+    fprintf(' %d', round(bshells_ste(n)));
+ end   
+fprintf('\n'); 
+
+if (max(length(bshells_lte),length(bshells_ste)) < 4) 
+    if doFWEsupplied && opt.doFWE
+        warning('Too few shells for FWE, but FWE has been requested from inputted options. Expect errors.\n');
+    else
+        fprintf('Too few shells for FWE. Using standard fitting...\n')
+        opt.doFWE = 0;
+    end
+end
+
+%% Perform powder averaging, and extract voxels from mask
+Nmask = sum(int16(mask(:)));
+signal_STE = zeros(length(bshells_ste), Nmask);
+for n=1:length(bshells_ste)
+    inds = and(isIso, abs(bval-bshells_ste(n))<opt.bthresh);
+    im_t = mean(im(:,:,:,inds),4);
+    signal_STE(n,:) = im_t(mask);
+end
+signal_LTE = zeros(length(bshells_lte), Nmask);
+for n=1:length(bshells_lte)
+    inds = and(~isIso, abs(bval-bshells_lte(n))<opt.bthresh);
+    im_t = mean(im(:,:,:,inds),4);
+    signal_LTE(n,:) = im_t(mask);
+end
+
+% Prep output
+szIm = size(im);
+D    = zeros(szIm(1:3),'like',im);
+Kiso = zeros(szIm(1:3),'like',im);
+Klin = zeros(szIm(1:3),'like',im);
+sf   = zeros(szIm(1:3),'like',im);
+uFA  = zeros(szIm(1:3),'like',im);
+
+if opt.doFWE
+    %% Part 1 of fwe algorithm: fit low b STE to FWE assuming no kurtosis for initial guesses signal fraction 
+    % Note: LTE signal with b~0 is also used, since this is virtually identical to STE at such low b.
+    signal_DTI = cat(1,signal_LTE(bshells_lte<opt.bthresh,:),signal_STE(bshells_ste<1100,:));
+    bDTI = cat(1,bshells_lte(bshells_lte<opt.bthresh),bshells_ste(bshells_ste<1100,:));
+    
+    if length(bDTI) < 3
+        % Include LTE if there are not enough STE shells
+        signal_DTI = cat(1,signal_LTE(bshells_lte<1100,:),signal_STE(bshells_ste<1100,:));
+        bDTI = cat(1,bshells_lte(bshells_lte<1100),bshells_ste(bshells_ste<1100,:));
+    end
+    if length(bDTI) < 3
+        error('At least 3 b-shells with b<=1000 s/mm2 required for free water elimination (including b0).')
+    end
+    
+    if useGPU
+        signal_DTI = gpuArray(signal_DTI);
+        bDTI = gpuArray(bDTI);
+        signal_LTE = gpuArray(signal_LTE);
+        signal_STE = gpuArray(signal_STE);
+        bshells_lte = gpuArray(bshells_lte);
+        bshells_ste = gpuArray(bshells_ste);
+    end
+    [sigTissue,sigCSF,~] = estD_powderFWE(signal_DTI,bDTI,D_CSF,opt); 
+    
+    
+    %% Fit data to the full FWE-DKI model 
+    % Note that we put the b0 vals into signal_LTE only to avoid repeating them.
+    [D2,Klin2,Kiso2,sigTissue,sigCSF] =...
+        estKurt_powderFWE(signal_LTE,signal_STE,bshells_lte(:),bshells_ste(:),...
+        D_CSF,sigTissue,sigCSF,opt);
+    sf2 = sigTissue./(sigTissue + sigCSF);
+    uFA2 = computeUFA(Klin2,Kiso2);
+    
+    % Save to output
+    if useGPU
+        D2 = gather(D2);
+        Klin2 = gather(Klin2);
+        Kiso2 = gather(Kiso2);
+        sf2 = gather(sf2);
+        uFA2 = gather(uFA2);
+    end
+    D(mask) = D2;
+    Kiso(mask) = Kiso2;
+    Klin(mask) = Klin2;
+    sf(mask) = sf2;
+    uFA(mask) = uFA2;
+end
+
+% Compute uA^22 if the shells support it
+uA2 = [];
+uA22 = [];
+if abs(max(bshells_lte)-max(bshells_ste))/(max(max(bshells_lte),max(bshells_ste))) < 0.05
+    [~,ind_lte] = max(bshells_lte);
+    [~,ind_ste] = max(bshells_ste);
+    uA22 = log(signal_LTE(ind_lte,:)./signal_STE(ind_ste,:))/mean([bshells_lte(ind_lte),bshells_ste(ind_ste)])^2;
+    uA22(uA22 < 0) = 0;
+    if useGPU
+        uA2 = gather(uA2);
+    end
+    uA2  = zeros(szIm(1:3),'like',im);
+    uA2(mask) = uA22;
+end
+
+%% Compute regular uFA for comparison
+if (nargout > 6) || ~opt.doFWE
+    [D2,Klin2,Kiso2] =...
+        estKurt_powderFWE(signal_LTE,signal_STE,bshells_lte(:),reshape(bshells_ste(:),[],1));
+    uFA2 = computeUFA(Klin2,Kiso2);
+
+    % Prepare output
+    if useGPU
+        D2 = gather(D2);
+        Klin2 = gather(Klin2);
+        Kiso2 = gather(Kiso2);
+        uFA2 = gather(uFA2);
+    end
+    if opt.doFWE
+        D_noFWE    = zeros(szIm(1:3),'like',im);
+        Kiso_noFWE = zeros(szIm(1:3),'like',im);
+        Klin_noFWE = zeros(szIm(1:3),'like',im);
+        uFA_noFWE  = zeros(szIm(1:3),'like',im);
+        D_noFWE(mask) = D2;
+        Kiso_noFWE(mask) = Kiso2;
+        Klin_noFWE(mask) = Klin2;
+        uFA_noFWE(mask)  = uFA2;
+    else
+        D_noFWE = [];
+        Kiso_noFWE = [];
+        Klin_noFWE = [];
+        uFA_noFWE = [];
+        D(mask) = D2;
+        Kiso(mask) = Kiso2;
+        Klin(mask) = Klin2;
+        uFA(mask) = uFA2;
+        sf(:) = 1;
+    end
+end
+
+% Reformat dims of signal vectors
+tmp = zeros(szIm(1:3),'like',im);
+sLTE = zeros([szIm(1:3), size(signal_LTE,1)],'like',im);
+for n=1:size(signal_LTE,1)
+    tmp(mask) = signal_LTE(n,:);
+    sLTE(:,:,:,n) = tmp;
+end
+sSTE = zeros([szIm(1:3), size(signal_STE,1)],'like',im);
+for n=1:size(signal_STE,1)
+    tmp(mask) = signal_STE(n,:);
+    sSTE(:,:,:,n) = tmp;
+end
+clear tmp
+
+% Create NIFTI files. Inherit header information from input NIFTI
+if opt.saveNifti && ischar(file)
+    im_info = niftiinfo(file);
+    im_info.PixelDimensions = im_info.PixelDimensions(1:3);
+    im_info.ImageSize = im_info.ImageSize(1:3);
+    im_info.raw.dim(1) = 3;
+    im_info.raw.dim(5) = 1;
+    im_info.raw.pixdim(5) = 0;
+    im_info.raw.dim_info = ' ';
+    %
+    im_info.Datatype = 'single';
+    im_info.BitsPerPixel = 32;
+    im_info.raw.datatype = 16;
+    im_info.raw.bitpix = 32;
+
+    if isempty(savename)
+        [filepath,savename,ext] = fileparts(file);
+        if strcmp(ext,'.gz')
+            [~,savename,~] = fileparts(savename); 
+        end
+        savename(savename=='.') = '_'; % niftiwrite does not like periods in name
+        % savename = [fpath,filesep,savename]; % put path back on
+    end
+
+    niftiwrite(single(D), sprintf('%s_D', savename), im_info, 'Compressed', true);
+    niftiwrite(single(uFA), sprintf('%s_uFA', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Kiso), sprintf('%s_Kiso', savename), im_info, 'Compressed', true);
+    niftiwrite(single(Klin), sprintf('%s_Klin', savename), im_info, 'Compressed', true);
+    niftiwrite(single(sf), sprintf('%s_sigFrac', savename), im_info, 'Compressed', true);
+    if ~isempty(uA2)
+        niftiwrite(single(uA2), sprintf('%s_uA2', savename), im_info, 'Compressed', true);
+    end
+    if ~isempty(D_noFWE)
+        niftiwrite(single(D_noFWE), sprintf('%s_D_noFWE', savename), im_info, 'Compressed', true);
+        niftiwrite(single(uFA_noFWE), sprintf('%s_uFA_noFWE', savename), im_info, 'Compressed', true);
+        niftiwrite(single(Kiso_noFWE), sprintf('%s_Kiso_noFWE', savename), im_info, 'Compressed', true);
+        niftiwrite(single(Klin_noFWE), sprintf('%s_Klin_noFWE', savename), im_info, 'Compressed', true);
+    end
+    %TODO: write out FA (have code for tensor now)
+    im_info0=im_info;
+
+    LTE_all=im(:,:,:,~isIso);
+    LTE_bval=bval(~isIso);
+    LTE_bvec=bvec(:,~isIso);
+    im_info = im_info0;
+    if size(LTE_all,4) > 1
+        im_info.PixelDimensions(4) = 1;
+        im_info.raw.dim(1) = 4;
+        im_info.raw.pixdim(5) = 1;
+        im_info.raw.dim(5) = size(LTE_all,4);
+        im_info.ImageSize = [im_info.ImageSize, size(LTE_all,4)];
+    end
+    niftiwrite(single(LTE_all), sprintf('%s_LTE_all', savename), im_info, 'Compressed', true);
+    save_fslvec(LTE_bval, LTE_bvec, sprintf('%s_LTE_all', savename))
+    
+    STE_all=im(:,:,:,isIso);
+    STE_bval=bval(isIso);
+    STE_bvec=bvec(:,isIso);    
+    im_info = im_info0;
+    if size(STE_all,4) > 1
+        im_info.PixelDimensions(4) = 1;
+        im_info.raw.dim(1) = 4;
+        im_info.raw.pixdim(5) = 1;
+        im_info.raw.dim(5) = size(STE_all,4);
+        im_info.ImageSize = [im_info.ImageSize, size(STE_all,4)];
+    end
+    niftiwrite(single(STE_all), sprintf('%s_STE_all', savename), im_info, 'Compressed', true);
+    save_fslvec(STE_bval, STE_bvec, sprintf('%s_STE_all', savename))
+
+    im_info = im_info0;
+    if size(sSTE,4) > 1
+        im_info.PixelDimensions(4) = 1;
+        im_info.raw.dim(1) = 4;
+        im_info.raw.pixdim(5) = 1;
+        im_info.raw.dim(5) = size(sSTE,4);
+        im_info.ImageSize = [im_info.ImageSize, size(sSTE,4)];
+    end
+    niftiwrite(single(sSTE), sprintf('%s_sSTE', savename), im_info, 'Compressed', true);
+    im_info = im_info0;
+    if size(sLTE,4) > 1
+        im_info.PixelDimensions(4) = 1;
+        im_info.raw.dim(1) = 4;
+        im_info.raw.pixdim(5) = 1;
+        im_info.raw.dim(5) = size(sLTE,4);
+        im_info.ImageSize = [im_info.ImageSize, size(sLTE,4)];
+    end
+    niftiwrite(single(sLTE), sprintf('%s_sLTE', savename), im_info, 'Compressed', true);
+
+end
+
+fprintf('Total computation time: %.1f min\n', toc(tic_a)/60);
+
+end
+
+function uFA = computeUFA(Klin,Kiso)
+    u2 = 1/3*(Klin-Kiso);
+    u2(u2<0) = 0; % negative anisotropy is non-physical
+    uFA = sqrt(1.5./(1+(0.4./u2))); 
+    uFA = abs(uFA);
+    uFA(uFA>sqrt(1.5))=sqrt(1.5);
+end
+
+function save_fslvec (bvals, bvecs, name)
+
+    % Save bvals
+    fid = fopen([name '.bval'], 'w');
+    fprintf(fid, '%.6f ', bvals);
+    fprintf(fid, '\n');
+    fclose(fid);
+    
+    % Save bvecs (each row is x, y, z components across volumes)
+    fid = fopen([name '.bvec'], 'w');
+    for i = 1:3
+        fprintf(fid, '%.6f ', bvecs(i, :));
+        fprintf(fid, '\n');
+    end
+    fclose(fid);
+
+end
+
